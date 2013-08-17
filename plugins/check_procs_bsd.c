@@ -26,7 +26,7 @@
 #include <string.h>
 #include <libgen.h>
 
-#define MAX_PSTATUS_LEN 5
+#define MAX_PSTATUS_LEN 7
 #define MAX_USERNAME_LEN 100
 #define MAX_PARGS_LEN 1000
 
