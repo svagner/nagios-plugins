@@ -10,6 +10,9 @@
 * 
 * This file contains the check_procs_bsd plugin
 * using kvm(3) interface
+*
+* URL: https://github.com/svagner/nagios-plugins
+* compile with options: clang -lkvm check_procs_bsd.c -o check_procs_bsd
 * 
 *****************************************************************************/
 
@@ -45,17 +48,58 @@
 #define DEBUG	    0
 #endif
 
+#ifndef __FreeBSD_version
+#error
+#endif
+
+// 
+#define FCOMMAND    0x00000001
+#define FARGS	    0x00000010
+#define FSTATUS	    0x00000100
+#define FWSTATUS    0x00001000
+#define FPID	    0x00010000
+#define FUSER	    0x00100000
+#define FWARNING    0x01000000
+#define FCRITICAL   0x10000000
+
+typedef unsigned short bool;  
+typedef struct {
+	char *pname;
+	char **pargs;
+	int pstate;
+	int pid;
+	char *uid;
+} t_procinfo;
+
+typedef struct {
+#if (__FreeBSD_version==901504)	
+	char pcmd[TDNAMLEN+1];
+#elif (__FreeBSD_version<901504)	
+	char pcmd[MAX_PARGS_LEN+1];
+#endif	
+	char pargs[MAX_PARGS_LEN];
+	char pstate[MAX_PSTATUS_LEN];
+	char pwstate[MAX_PSTATUS_LEN];
+	int ppid;
+	char puid[LOGNAMELEN+1];
+	int warn_upper_limit;
+	int warn_lover_limit;
+	int crit_lover_limit;
+	int crit_upper_limit;
+	struct timeval ki_start;
+} t_filters;
+
+bool v_debug;
+
 int p_error(int code);
 void usage(char *myname);
 void p_help(char *myname);
 void check_status_arg(char *arg);
-void check_limit_arg(int uwarn, int lwarn, int ucrit, int lcrit);
-int check_final_result(int uwarn, int lwarn, int ucrit, int lcrit, int numproc);
-
-typedef unsigned short bool;  
-bool v_debug;
-bool use_warn;
-bool use_crit;
+void check_limit_arg(unsigned int filters, t_filters *f);
+int check_final_result(unsigned int filters, t_filters *f, int numproc);
+unsigned int check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f);
+int check_proc_status(int status, char *filter);
+int result_print(int errcode, unsigned int filter, t_filters *f, int s_pnum);
 
 void usage(char *myname) 
 {
@@ -77,16 +121,16 @@ p_error(int ecode)
 }
 
 int 
-check_final_result(int uwarn, int lwarn, int ucrit, int lcrit, int numproc)
+check_final_result(unsigned int filters, t_filters *f, int numproc)
 {
 	int errcode;
-	if (use_warn && (numproc < uwarn || numproc > lwarn))
+	if ((filters & FWARNING) && (numproc < f->warn_upper_limit || numproc > f->warn_lover_limit))
 		errcode = 0;
-	if (use_warn && use_crit && ((numproc >= uwarn && numproc < ucrit) || (numproc <= lwarn && numproc > lcrit)))
+	if ((filters & FWARNING) && (filters & FCRITICAL) && ((numproc >= f->warn_upper_limit && numproc < f->crit_upper_limit) || (numproc <= f->warn_lover_limit && numproc > f->crit_lover_limit)))
 		errcode = 1;
-	if (use_crit && (numproc >= ucrit || numproc <= lcrit))
+	if ((filters & FCRITICAL) && (numproc >= f->crit_upper_limit || numproc <= f->crit_lover_limit))
 		errcode = 2;
-	if (!use_warn && !use_crit)
+	if (!(filters & FWARNING) && !(filters & FCRITICAL))
 		errcode = 0;
 	if (v_debug)
 	    fprintf(stderr, "Error code: %d\n", errcode);
@@ -107,35 +151,37 @@ check_status_arg(char *arg)
 		for (ii=0;ii<vlistcnt;ii++)
 			if (arg[i] == valid[ii])
 				vcnt++;
+		if (!vcnt)
+			goto exit;
+		vcnt = 0;
 	}
-	if (!vcnt)
-	{
-		fprintf(stderr, "Status argument is not valid. It can be only - \"[F | R | D | T | Z | W | L]\". Please, read the help\n");
-		exit(2);
-	}
+	return;
+exit:
+	fprintf(stderr, "Status argument is not valid. It can be only - \"[F | R | D | T | Z | W | L]\". Please, read the help\n");
+	exit(2);
 }
 
 void 
-check_limit_arg(int uwarn, int lwarn, int ucrit, int lcrit)
+check_limit_arg(unsigned int filters, t_filters *f)
 {
-	if (uwarn < lwarn)
+	if (f->warn_upper_limit < f->warn_lover_limit)
 	{
-		fprintf(stderr, "Limit argument for Warning check status is not correct. Upper value (%d) < Lover value (%d)\n", uwarn, lwarn);
+		fprintf(stderr, "Limit argument for Warning check status is not correct. Upper value (%d) < Lover value (%d)\n", f->warn_upper_limit, f->warn_lover_limit);
 		exit(2);
 	}
-	if (ucrit < lcrit)
+	if (f->crit_upper_limit < f->crit_lover_limit)
 	{
-		fprintf(stderr, "Limit argument for Critical check status is not correct. Upper value (%d) < Lover value (%d)\n", ucrit, lcrit);
+		fprintf(stderr, "Limit argument for Critical check status is not correct. Upper value (%d) < Lover value (%d)\n", f->crit_upper_limit, f->crit_lover_limit);
 		exit(2);
 	}
-	if ( use_warn && use_crit && uwarn > ucrit)
+	if ((filters & FWARNING) && (filters & FCRITICAL) && f->warn_upper_limit > f->crit_upper_limit)
 	{
-		fprintf(stderr, "Limit argument for check status is not correct. Upper value for warning (%d) > Upper value for critical (%d)\n", uwarn, ucrit);
+		fprintf(stderr, "Limit argument for check status is not correct. Upper value for warning (%d) > Upper value for critical (%d)\n", f->warn_upper_limit, f->crit_upper_limit);
 		exit(2);
 	}
-	if (use_warn && use_crit && lwarn < lcrit)
+	if ((filters & FWARNING) && (filters & FCRITICAL) && f->warn_lover_limit < f->crit_lover_limit)
 	{
-		fprintf(stderr, "Limit argument for check status is not correct. Lower value for warning (%d) < Lover value for critical (%d)\n", lwarn, lcrit);
+		fprintf(stderr, "Limit argument for check status is not correct. Lower value for warning (%d) < Lover value for critical (%d)\n", f->warn_lover_limit, f->crit_lover_limit);
 		exit(2);
 	}
 }
@@ -170,9 +216,7 @@ main (int argc, char **argv)
     struct kinfo_proc* kp;
     kvm_t *kd;
     int cntp;
-    int ppid;
     char *errbuf;
-    char **pargs;
     char *sep = ":";
     char *res;
     // parse opt
@@ -180,52 +224,44 @@ main (int argc, char **argv)
     int print_all;
     int i;
     // parametr's check
+    t_filters Filters;
     unsigned int m_warn;
     char *m_swarn;
     unsigned int m_uwarn;
     unsigned int m_lwarn;
     unsigned int m_crit;
     char *m_scrit;
-    unsigned int m_ucrit;
-    unsigned int m_lcrit;
-    unsigned int m_pid;
-    char m_status[MAX_PSTATUS_LEN];
-    char m_user[MAX_USERNAME_LEN];
-    char m_command[MAX_PARGS_LEN];
-    char m_arguments[MAX_PARGS_LEN];
+    unsigned int filter = 0;
     //status var
     unsigned int s_pnum;
-    char *s_pname;
     pid_t s_mypid;
     char *s_myname;
     int errcode;
 
-    use_warn = use_crit = v_debug = FALSE; //debug print = false
+    v_debug = FALSE; //debug print = false
 
     s_mypid = getpid();
     s_myname = argv[0];
 
-    bzero(m_status, MAX_PSTATUS_LEN);
-    bzero(m_user, MAX_USERNAME_LEN);
-    bzero(m_command, MAX_PARGS_LEN);
-    bzero(m_arguments, MAX_PARGS_LEN);
+    bzero(&Filters, sizeof(t_filters));
 
-    m_warn = m_uwarn = m_lwarn = m_crit = m_ucrit = m_lcrit = m_pid = print_all = 0;
+    m_warn = m_crit = print_all = 0;
     s_pnum = errcode = 0;
 
     print_all=argc;
 
     bflag = 0;
-    while ((ch = getopt(argc, argv, "w:c:s:p:u:C:a:hd")) != -1) {
+    while ((ch = getopt(argc, argv, "w:c:s:S:p:u:C:a:hd")) != -1) {
 	    switch (ch) {
 	    case 'w':
 		    m_warn = atoi(optarg);
+		    filter = filter ^ FWARNING;
 		    for (m_swarn = strtok(optarg, sep), i=0; m_swarn; (m_swarn = strtok(NULL, sep)) && i++)
 		    {
 			    if (!i)
-				    m_uwarn = atoi(m_swarn);
+				    Filters.warn_upper_limit = atoi(m_swarn);
 			    if (i==1)
-				    m_lwarn = atoi(m_swarn);
+				    Filters.warn_lover_limit = atoi(m_swarn);
 				    
 		    }
 		    if (i==0 || i>1)
@@ -233,52 +269,71 @@ main (int argc, char **argv)
 			    fprintf(stderr, "Limit argument for Warning check status isn't correct. Num: %d. Please, see help\n", i);
 			    exit(2);
 		    }
-		    use_warn = TRUE;
 		    break;
 	    case 'c':
 		    m_crit = atoi(optarg);
+		    filter = filter ^ FCRITICAL;
 		    for (m_scrit = strtok(optarg, sep), i=0; m_scrit; (m_scrit = strtok(NULL, sep)) && i++)
 		    {
 			    if (!i)
-				    m_ucrit = atoi(m_scrit);
+				    Filters.crit_upper_limit = atoi(m_scrit);
 			    if (i==1)
-				    m_lcrit = atoi(m_scrit);
-				    
+				    Filters.crit_lover_limit = atoi(m_scrit);
 		    }
 		    if (i==0 || i>1)
 		    {
 			    fprintf(stderr, "Limit argument for Critical check status isn't correct. Num: %d. Please, see help\n", i);
 			    exit(2);
 		    }
-		    use_crit = TRUE;
 		    break;
 	    case 'p':
-		    m_pid = atoi(optarg);
+		    filter = filter ^ FPID;
+		    Filters.ppid = atoi(optarg);
 		    break;
 	    case 's':
 		    if (strlen(optarg) <= MAX_PSTATUS_LEN)
 		    {
 			    check_status_arg(optarg);
-			    strcpy(m_status, optarg);
+			    filter = filter ^ FSTATUS;
+			    strcpy(Filters.pstate, optarg);
+		    }
+		    else
+			    p_error(E_BUFF);
+		    break;
+	    case 'S':
+		    if (strlen(optarg) <= MAX_PSTATUS_LEN)
+		    {
+			    check_status_arg(optarg);
+			    filter = filter ^ FWSTATUS;
+			    strcpy(Filters.pwstate, optarg);
 		    }
 		    else
 			    p_error(E_BUFF);
 		    break;
 	    case 'u':
 		    if (strlen(optarg) <= MAX_USERNAME_LEN)
-			    strcpy(m_user, optarg);
+		    {
+			    filter = filter ^ FUSER;
+			    strcpy(Filters.puid, optarg);
+		    }
 		    else
 			    p_error(E_BUFF);
 		    break;
 	    case 'C':
 		    if (strlen(optarg) <= MAX_PARGS_LEN)
-			    strcpy(m_command, optarg);
+		    {
+			    filter = filter ^ FCOMMAND;
+			    strcpy(Filters.pcmd, optarg);
+		    }
 		    else
 			    p_error(E_BUFF);
 		    break;
 	    case 'a':
 		    if (strlen(optarg) <= MAX_PARGS_LEN)
-			    strcpy(m_arguments, optarg);
+		    {
+			    filter = filter ^ FARGS;
+			    strcpy(Filters.pargs, optarg);
+		    }
 		    else
 			    p_error(E_BUFF);
 		    break;
@@ -295,7 +350,10 @@ main (int argc, char **argv)
     argc -= optind;
     argv += optind;
 
-    check_limit_arg(m_uwarn, m_lwarn, m_ucrit, m_lcrit);
+    if (v_debug)
+	printf("%p\n", filter);
+
+    check_limit_arg(filter, &Filters);
 
     kd = kvm_open(NULL, "/dev/null", NULL, O_RDONLY, errbuf);
     kp = kvm_getprocs(kd, KERN_PROC_PROC, 0, &cntp);
@@ -307,133 +365,189 @@ main (int argc, char **argv)
 	exit(0);
     }
 
-    if (v_debug)
-	printf("Mypid: %d\n", s_mypid);
     for(;cntp>0;cntp-- && kp++)
     {
 	int stcnt = 0;	
-	ppid = kp->ki_pid;    
-	pargs = kvm_getargv(kd, kp, 0);
-	if (s_mypid == ppid)
+	t_procinfo proc_info;
+	
+	proc_info.pid = kp->ki_pid;
+	if (s_mypid == proc_info.pid)
 	{
 		if (v_debug)
 		    printf("Mypid: continue...\n");
 		continue;
 	}
-	if (pargs)
-	    s_pname = strtok(basename(pargs[0]), sep);
-	if (!s_pname && strlen(m_command)>0)
-	    continue;	
-	if (strlen(m_command)>0)
+
+	if (kp->ki_args)
+	    proc_info.pargs = kvm_getargv(kd, kp, 0);
+	proc_info.pstate = kp->ki_stat;
+	proc_info.uid = kp->ki_login;
+
+	if (proc_info.pargs)
+	    proc_info.pname = strtok(basename(proc_info.pargs[0]), sep);	
+	else
+#if (__FreeBSD_version==901504)	
+	    proc_info.pname = kp->ki_tdname;
+#elif (__FreeBSD_version<901504)	
+	    proc_info.pname = kp->ki_ocomm;
+#endif	
+
+	if (!check_proc_filters(filter, &proc_info, &Filters))
 	{
-	    if (!strcmp(m_command, s_pname)) 
-	    {
-		    s_pnum++;
-		    if (v_debug)
-			printf("Add: m_command: %s pid: %d\n", s_pname, ppid);
-	    }
-	    else
-		    continue;
+		s_pnum++;
+		Filters.ki_start.tv_sec = kp->ki_start.tv_sec;
+		Filters.ki_start.tv_usec = kp->ki_start.tv_usec;
 	}
-	if (strlen(m_arguments) && pargs)
+    }
+
+    errcode = check_final_result(filter, &Filters, s_pnum);
+	    
+    result_print(errcode, filter, &Filters, s_pnum);
+
+    kvm_close(kd);
+    exit(errcode);
+}
+
+unsigned int 
+check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f)
+{
+	unsigned int errcode;
+	char *res;
+	int i, cnt; 
+	unsigned int result = 0x0000000000;
+	i = cnt = 0;
+	res = NULL;
+
+	if (filters & FCOMMAND && !strcmp(f->pcmd, pinfo->pname)) 
+		result = result ^ FCOMMAND;
+	if (filters & FARGS && pinfo->pargs) 
 	{
-	    int argcnt = 0;	
-	    for (i=1; pargs[i]; i++)
+	    for (i=1; pinfo->pargs[i]; i++)
 	    {
-		res = strstr(pargs[i], m_arguments);    
+		res = strstr(pinfo->pargs[i], f->pargs);    
 		if (res)
 		{
-		    argcnt++;
+		    cnt++;
 		    break;
 		}
 	    }
-	    if (argcnt && !strlen(m_command))
-		    s_pnum++;
-	    if (!argcnt && strlen(m_command)>0 && s_pnum)
-		    s_pnum--;
+	    if (cnt)
+		result = result ^ FARGS;    
 	}
-	
-	for (i=0; m_status[i]; i++)
-	{
-	    if (!s_pnum)
-		    continue;
-	    if (strlen(m_command)>0 || strlen(m_arguments)>0)
-	    {
-		switch (kp->ki_stat)
-		{
-		    case SSTOP: /* Process debugging or suspension. */
-			if (m_status[i] == 'T') stcnt++;
-			break;
-		    case SSLEEP: /* Sleeping on an address. */
-			if (m_status[i] == 'D') stcnt++;
-			break;
-		    case SIDL: /* Process being created by fork */
-			if (m_status[i] == 'F') stcnt++;
-			break;
-		    case SWAIT: /* Waiting for interrupt. */
-			if (m_status[i] == 'W') stcnt++;
-			break;
-		    case SLOCK: /* Blocked on a lock. */
-			if (m_status[i] == 'L') stcnt++;
-			break;
-		    case SZOMB: /* Awaiting collection by parent. */
-			if (m_status[i] == 'Z') stcnt++;
-			break;
-		    case SRUN: /* Currently runnable. */
-			if (m_status[i] == 'R') stcnt++;
-			break;
-		}
-	    }
-	    else
-	    {
-		switch (kp->ki_stat)
-		{
-		    case SSTOP: /* Process debugging or suspension. */
-			if (m_status[i] == 'T') stcnt++; s_pnum++;
-			break;
-		    case SSLEEP: /* Sleeping on an address. */
-			if (m_status[i] == 'D') stcnt++; s_pnum++;
-			break;
-		    case SIDL: /* Process being created by fork */
-			if (m_status[i] == 'F') stcnt++; s_pnum++;
-			break;
-		    case SWAIT: /* Waiting for interrupt. */
-			if (m_status[i] == 'W') stcnt++; s_pnum++;
-			break;
-		    case SLOCK: /* Blocked on a lock. */
-			if (m_status[i] == 'L') stcnt++; s_pnum++;
-			break;
-		    case SZOMB: /* Awaiting collection by parent. */
-			if (m_status[i] == 'Z') stcnt++; s_pnum++;
-			break;
-		    case SRUN: /* Currently runnable. */
-			if (m_status[i] == 'R') stcnt++; s_pnum++;
-			break;
-		}
-	    }
-	    //printf("%d:  %d:%d\n", kp->ki_pid, kp->ki_stat, kistate->m_status[0]);
-	}
-	if (!stcnt && m_status[0] && s_pnum)
-		s_pnum--;
-	s_pname = NULL;
-    }
+	if (filters & FSTATUS && check_proc_status(pinfo->pstate, f->pstate))
+		result = result ^ FSTATUS;
 
-    errcode = check_final_result(m_uwarn, m_lwarn, m_ucrit, m_lcrit, s_pnum);
-	    
-    switch (errcode) {
+	if (filters & FWSTATUS && !check_proc_status(pinfo->pstate, f->pwstate))
+		result = result ^ FWSTATUS;
+
+	if (filters & FCRITICAL)
+		result = result ^ FCRITICAL;
+
+	if (filters & FWARNING)
+		result = result ^ FWARNING;
+
+	if (filters & FPID && (pinfo->pid == f->ppid))
+		result = result ^ FPID;
+
+	if (v_debug)
+	    printf("result:%p filters:%p\n", result, filters);
+	errcode = filters ^ result;
+	if (v_debug)
+	    printf("Error code from check_proc_filters: %d\n", errcode);
+	return errcode;
+};
+
+int
+check_proc_status(int status, char *filter)
+{
+	int i;
+	int errcode = 0;
+
+	for (i=0; filter[i]; i++)
+	{
+	    switch (status)
+	    {
+		case SSTOP: /* Process debugging or suspension. */
+			if (filter[i] == 'T') errcode++;
+			break;
+		case SSLEEP: /* Sleeping on an address. */
+			if (filter[i] == 'D') errcode++;
+			break;
+		case SIDL: /* Process being created by fork */
+			if (filter[i] == 'F') errcode++;
+			break;
+		case SWAIT: /* Waiting for interrupt. */
+			if (filter[i] == 'W') errcode++;
+			break;
+		case SLOCK: /* Blocked on a lock. */
+			if (filter[i] == 'L') errcode++;
+			break;
+		case SZOMB: /* Awaiting collection by parent. */
+			if (filter[i] == 'Z') errcode++;
+			break;
+		case SRUN: /* Currently runnable. */
+			if (filter[i] == 'R') errcode++;
+			break;
+	    }
+	}
+	return errcode;
+}
+
+int 
+result_print(int errcode, unsigned int filter, t_filters *f, int s_pnum)
+{
+	struct tm *tp;
+	time_t then;
+	size_t buflen = 1000;
+	char *runtimebuf;
+	static int use_ampm = -1;
+	time_t now;
+
+	time(&now);
+	runtimebuf = malloc(buflen);
+
+	then = f->ki_start.tv_sec;
+	tp = localtime(&then);
+
+	if (now - f->ki_start.tv_sec < 24 * 3600) {
+		(void)strftime(runtimebuf, buflen, use_ampm ? "%l:%M%p" : "%k:%M  ", tp);
+	} else if (now - f->ki_start.tv_sec < 7 * 86400)
+	{
+		(void)strftime(runtimebuf, buflen,use_ampm ? "%a%I%p" : "%a%H  ", tp);
+	}
+	else
+		(void)strftime(runtimebuf, buflen, "%e%b%y", tp);
+
+	switch (errcode) {
 	    case 0:
-		if (strlen(m_command) && strlen(m_status) && strlen(m_arguments)) printf("%s: %d processes with parametrs name: \"%s\" args: \"%s\" status: \"%s\"\n", OK, s_pnum, m_command, m_arguments, m_status);
-		else printf("%s: %d processes\n", OK, s_pnum);
+		printf("%s:", OK);
 		break;
 	    case 1:	
-		if (strlen(m_command) && strlen(m_status) && strlen(m_arguments)) printf("%s: %d processes with parametrs name: \"%s\" args: \"%s\" status: \"%s\"\n", WARNING, s_pnum, m_command, m_arguments, m_status);
-		else printf("%s: %d processes\n", WARNING, s_pnum);
+		printf("%s:", WARNING);
 		break;
 	    case 2:	
-		if (strlen(m_command) && strlen(m_status) && strlen(m_arguments)) printf("%s: %d processes with parametrs name: \"%s\" args: \"%s\" status: \"%s\"\n", CRITICAL, s_pnum, m_command, m_arguments, m_status);
-		else printf("%s: %d processes\n", CRITICAL, s_pnum);
+		printf("%s:", CRITICAL);
 		break;
-    }
-    kvm_close(kd);
-    exit(errcode);
+	}
+
+	printf(" %d processes", s_pnum);
+
+	if (filter != 0)
+		printf(" with parametrs");
+	if (filter & FCOMMAND)
+		printf(" name: \'%s\'", f->pcmd);
+	if (filter & FARGS)
+		printf(" args_like: \'%s\'", f->pargs);
+	if (filter & FPID)
+		printf(" pid: \'%s\'", f->ppid);
+	if (filter & FSTATUS)
+		printf(" status: \'%s\'", f->pstate);
+	if (filter & FWSTATUS)
+		printf(" not_status: \'%s\'", f->pwstate);
+	if (s_pnum > 0)
+	    printf(". Last procs is run at: %s", runtimebuf);
+	else
+	    printf(".\n");
+	free(runtimebuf);
+	return 0;
 }
