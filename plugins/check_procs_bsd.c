@@ -369,6 +369,8 @@ main (int argc, char **argv)
     {
 	int stcnt = 0;	
 	t_procinfo proc_info;
+
+	bzero(&proc_info, sizeof(t_procinfo));
 	
 	proc_info.pid = kp->ki_pid;
 	if (s_mypid == proc_info.pid)
