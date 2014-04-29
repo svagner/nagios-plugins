@@ -30,6 +30,7 @@
 #include <libgen.h>
 
 #define MAX_PSTATUS_LEN 7
+#define MAX_TSTATUS_LEN 7
 #define MAX_USERNAME_LEN 100
 #define MAX_PARGS_LEN 1000
 
@@ -53,14 +54,21 @@
 #endif
 
 // 
-#define FCOMMAND    0x00000001
-#define FARGS	    0x00000010
-#define FSTATUS	    0x00000100
-#define FWSTATUS    0x00001000
-#define FPID	    0x00010000
-#define FUSER	    0x00100000
-#define FWARNING    0x01000000
-#define FCRITICAL   0x10000000
+#define FCOMMAND    0x0000000001
+#define FARGS	    0x0000000010
+#define FSTATUS	    0x0000000100
+#define FWSTATUS    0x0000001000
+#define FPID	    0x0000010000
+#define FUSER	    0x0000100000
+#define FWARNING    0x0001000000
+#define FCRITICAL   0x0010000000
+#define TSTATUS	    0x0100000000
+#define TWSTATUS    0x1000000000
+
+#define SGOOD       0x01
+#define SBAD        0x10
+
+#define WMESGLEN    8
 
 typedef unsigned short bool;  
 typedef struct {
@@ -69,7 +77,14 @@ typedef struct {
 	int pstate;
 	int pid;
 	char *uid;
+	char *tstate;
 } t_procinfo;
+
+typedef struct {
+    unsigned int pid;
+    unsigned int cnt;
+    unsigned short state;
+} pid_s;
 
 typedef struct {
 #if (__FreeBSD_version==901504)	
@@ -80,6 +95,8 @@ typedef struct {
 	char pargs[MAX_PARGS_LEN];
 	char pstate[MAX_PSTATUS_LEN];
 	char pwstate[MAX_PSTATUS_LEN];
+    char tstate[MAX_TSTATUS_LEN];
+    char twstate[MAX_TSTATUS_LEN];
 	int ppid;
 	char puid[LOGNAMELEN+1];
 	int warn_upper_limit;
@@ -97,13 +114,14 @@ void p_help(char *myname);
 void check_status_arg(char *arg);
 void check_limit_arg(unsigned int filters, t_filters *f);
 int check_final_result(unsigned int filters, t_filters *f, int numproc);
-unsigned int check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f);
+uint64_t check_proc_filters(uint64_t filters, t_procinfo *pinfo, t_filters *f);
 int check_proc_status(int status, char *filter);
+int check_thread_status(char *status, char *filter);
 int result_print(int errcode, unsigned int filter, t_filters *f, int s_pnum);
 
 void usage(char *myname) 
 {
-	fprintf(stderr, "Usage: %s [-C command] [-a arguments] [-s status] [-S status] [-p pid] [-u username] [-w warning_limit_upper:warning_limit_lower] [-c critical_limit_upper:critical_limit_lower] [-h]\n", myname);
+	fprintf(stderr, "Usage: %s [-C command] [-a arguments] [-s status] [-S status] [-p pid] [-u username] [-w warning_limit_upper:warning_limit_lower] [-c critical_limit_upper:critical_limit_lower] [-t] [-d] [-h]\n", myname);
 	exit(2);
 }
 
@@ -189,33 +207,49 @@ check_limit_arg(unsigned int filters, t_filters *f)
 void
 p_help(char *myname) 
 {
-	printf("Usage: %s [-C command] [-a arguments] [-s status] [-S status] [-p pid] [-u username] [-w warning_limit_upper:warning_limit_lower] [-c critical_limit_upper:critical_limit_lower] [-d] [-h]\n\n", myname);
-	printf("-C command   -- processes command, which meaning for find\n");
-	printf("-a arguments -- processes argument, which meaning for find\n");
-	printf("-s status    -- processes with status. Can be only:\n"); 
-	printf("                \"F\" - Process being created by fork\n");
-	printf("                \"R\" - Currently runnable\n");
-	printf("                \"D\" - Sleeping on an address\n");
-	printf("                \"T\" - Process debugging or suspension\n");
-	printf("                \"Z\" - Awaiting collection by parent (zombie)\n");
-	printf("                \"W\" - Waiting for interrupt\n");
-	printf("                \"L\" - Blocked on a lock\n");
-	printf("-S status    -- processes without status.\n"); 
-	printf("-p pid       -- find process with pid\n");
-	printf("-p user      -- find process which ran from user\n");
-	printf("-w warning   -- warning limit for check: [upper:lower]\n");
-	printf("-c critical  -- critical limit for check: [upper:lower]\n");
-	printf("-d           -- debug output\n");
-	printf("-h           -- print this help\n");
+	printf("Usage: %s [-C command] [-a arguments] [-s status] [-S status] [-W state] [-T state] [-p pid] [-u username] [-w warning_limit_upper:warning_limit_lower] [-c critical_limit_upper:critical_limit_lower] [-t] [-d] [-h]\n\n", myname);
+	printf("-C command      -- processes command, which meaning for find\n");
+	printf("-a arguments    -- processes argument, which meaning for find\n");
+	printf("-s status       -- processes with status. Can be only:\n"); 
+	printf("                    \"F\" - Process being created by fork\n");
+	printf("                    \"R\" - Currently runnable\n");
+	printf("                    \"D\" - Sleeping on an address\n");
+	printf("                    \"T\" - Process debugging or suspension\n");
+	printf("                    \"Z\" - Awaiting collection by parent (zombie)\n");
+	printf("                    \"W\" - Waiting for interrupt\n");
+	printf("                    \"L\" - Blocked on a lock\n");
+	printf("-W state        -- thread with state. Can be only:\n");
+	printf("                    \"l\" - uwrlck\n");
+	printf("                    \"w\" - uwait\n");
+	printf("-T state        -- thread without state. Can be only:\n");
+	printf("-S status       -- processes without status.\n"); 
+	printf("-p pid          -- find process with pid\n");
+	printf("-p user         -- find process which ran from user\n");
+	printf("-w warning      -- warning limit for check: [upper:lower]\n");
+	printf("-c critical     -- critical limit for check: [upper:lower]\n");
+	printf("-t              -- consider check threads\n");
+	printf("-d              -- debug output\n");
+	printf("-h              -- print this help\n");
 	exit(0);
+}
+
+static int
+compare_pidnums(const void *first, const void *second) {
+    if (((pid_s *)first)->pid > ((pid_s *)second)->pid) {
+        return 1;
+    } else if (((pid_s *)first)->pid < ((pid_s *)second)->pid) {
+        return -1;
+    } else {
+        return 0;
+    }
 }
 
 int
 main (int argc, char **argv)
 {
-    struct kinfo_proc* kp;
+    struct kinfo_proc* kp, *kpt;
     kvm_t *kd;
-    int cntp;
+    int cntp, cntpt;
     char *errbuf;
     char *sep = ":";
     char *res;
@@ -231,11 +265,14 @@ main (int argc, char **argv)
     unsigned int m_lwarn;
     unsigned int m_crit;
     char *m_scrit;
-    unsigned int filter = 0;
+    uint64_t filter = 0;
     //status var
     unsigned int s_pnum;
     pid_t s_mypid;
     char *s_myname;
+    // for threads check
+    pid_s *pidlist;
+    bool threads_check = FALSE;
     int errcode;
 
     v_debug = FALSE; //debug print = false
@@ -251,7 +288,7 @@ main (int argc, char **argv)
     print_all=argc;
 
     bflag = 0;
-    while ((ch = getopt(argc, argv, "w:c:s:S:p:u:C:a:hd")) != -1) {
+    while ((ch = getopt(argc, argv, "w:c:s:S:p:u:C:T:W:a:hdt")) != -1) {
 	    switch (ch) {
 	    case 'w':
 		    m_warn = atoi(optarg);
@@ -310,6 +347,26 @@ main (int argc, char **argv)
 		    else
 			    p_error(E_BUFF);
 		    break;
+	    case 'W':
+		    if (strlen(optarg) <= MAX_TSTATUS_LEN)
+		    {
+			    //check_status_arg(optarg);
+                filter = filter ^ TSTATUS;
+			    strcpy(Filters.tstate, optarg);
+		    }
+		    else
+			    p_error(E_BUFF);
+		    break;
+	    case 'T':
+		    if (strlen(optarg) <= MAX_TSTATUS_LEN)
+		    {
+			    //check_status_arg(optarg);
+                filter = filter ^ TWSTATUS;
+			    strcpy(Filters.twstate, optarg);
+		    }
+		    else
+			    p_error(E_BUFF);
+		    break;
 	    case 'u':
 		    if (strlen(optarg) <= MAX_USERNAME_LEN)
 		    {
@@ -343,6 +400,9 @@ main (int argc, char **argv)
 	    case 'd':	
 		    v_debug = TRUE;
 		    break;
+	    case 't':	
+		    threads_check = TRUE;
+		    break;
 	    default:
 		    usage(s_myname);
 	    }
@@ -351,55 +411,94 @@ main (int argc, char **argv)
     argv += optind;
 
     if (v_debug)
-	printf("%p\n", filter);
+	    printf("%p\n", filter);
 
     check_limit_arg(filter, &Filters);
 
     kd = kvm_open(NULL, "/dev/null", NULL, O_RDONLY, errbuf);
     kp = kvm_getprocs(kd, KERN_PROC_PROC, 0, &cntp);
-
-    if (print_all<2)
-    {
-	printf("%s: %d processes\n", OK, cntp);
-	kvm_close(kd);
-	exit(0);
+    if (threads_check) {
+        kpt = kvm_getprocs(kd, KERN_PROC_PROC, 0, &cntpt);
+        kp = kvm_getprocs(kd, KERN_PROC_PROC|KERN_PROC_INC_THREAD, 0, &cntp);
+        //pidlist = calloc(cntp, sizeof(pid_s));
+        pidlist = malloc(sizeof(pid_s)*cntpt);
+        memset(pidlist, 0, cntpt);
+    } else {
+        kp = kvm_getprocs(kd, KERN_PROC_PROC, 0, &cntp);
     }
 
-    for(;cntp>0;cntp-- && kp++)
-    {
-	int stcnt = 0;	
-	t_procinfo proc_info;
+    if (print_all<2) {
+	    printf("%s: %d processes\n", OK, cntp);
+	    kvm_close(kd);
+	    exit(0);
+    }
 
-	bzero(&proc_info, sizeof(t_procinfo));
+    for(;cntp>0;cntp-- && kp++) {
+	    int stcnt = 0;	
+	    t_procinfo proc_info;
+
+	    bzero(&proc_info, sizeof(t_procinfo));
 	
-	proc_info.pid = kp->ki_pid;
-	if (s_mypid == proc_info.pid)
-	{
-		if (v_debug)
-		    printf("Mypid: continue...\n");
-		continue;
-	}
+	    proc_info.pid = kp->ki_pid;
+	    if (s_mypid == proc_info.pid) {
+		    if (v_debug)
+		        printf("Mypid: continue...\n");
+		    continue;
+	    }
 
-	if (kp->ki_args)
-	    proc_info.pargs = kvm_getargv(kd, kp, 0);
-	proc_info.pstate = kp->ki_stat;
-	proc_info.uid = kp->ki_login;
+	    if (kp->ki_args)
+	        proc_info.pargs = kvm_getargv(kd, kp, 0);
+	    proc_info.pstate = kp->ki_stat;
+	    proc_info.tstate = kp->ki_wmesg;
+        //printf("%d - %d (%s) [%x]\n", kp->ki_pid, kp->ki_kiflag & KI_LOCKBLOCK, kp->ki_wmesg, kp->ki_wchan);
+	    proc_info.uid = kp->ki_login;
 
-	if (proc_info.pargs)
-	    proc_info.pname = strtok(basename(proc_info.pargs[0]), sep);	
-	else
+	    if (proc_info.pargs)
+	        proc_info.pname = strtok(basename(proc_info.pargs[0]), sep);	
+	    else
 #if (__FreeBSD_version==901504)	
-	    proc_info.pname = kp->ki_tdname;
+	        proc_info.pname = kp->ki_tdname;
 #elif (__FreeBSD_version<901504)	
-	    proc_info.pname = kp->ki_ocomm;
+	        proc_info.pname = kp->ki_ocomm;
 #endif	
 
-	if (!check_proc_filters(filter, &proc_info, &Filters))
-	{
-		s_pnum++;
-		Filters.ki_start.tv_sec = kp->ki_start.tv_sec;
-		Filters.ki_start.tv_usec = kp->ki_start.tv_usec;
-	}
+        pid_s *mypid;
+        pid_s search_key;
+	    if (!check_proc_filters(filter, &proc_info, &Filters)) {
+            if (threads_check) {
+                search_key.pid = kp->ki_pid;
+                if ((mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums))!=NULL) {
+                    if (mypid->state & SBAD)
+                        continue;
+                    mypid->cnt++;
+                } else  {
+                    search_key.pid = 0;
+                    mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums);
+                    mypid->pid = kp->ki_pid;
+                    mypid->cnt = 1;
+                    mypid->state = SGOOD;
+                    qsort(pidlist, cntpt, sizeof(pid_s), compare_pidnums);
+		            s_pnum++;
+                }
+            } else {
+		        s_pnum++;
+            }
+		    Filters.ki_start.tv_sec = kp->ki_start.tv_sec;
+		    Filters.ki_start.tv_usec = kp->ki_start.tv_usec;
+	    } else if (threads_check) {
+            search_key.pid = kp->ki_pid;
+            if ((mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums))!=NULL && mypid->state & SGOOD) { 
+                mypid->state = SBAD;
+                s_pnum--;
+            } else {
+                search_key.pid = 0;
+                mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums);
+                mypid->pid = kp->ki_pid;
+                mypid->cnt = 1;
+                mypid->state = SBAD;
+                qsort(pidlist, cntpt, sizeof(pid_s), compare_pidnums);
+            }
+        }
     }
 
     errcode = check_final_result(filter, &Filters, s_pnum);
@@ -410,13 +509,13 @@ main (int argc, char **argv)
     exit(errcode);
 }
 
-unsigned int 
-check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f)
+uint64_t 
+check_proc_filters(uint64_t filters, t_procinfo *pinfo, t_filters *f)
 {
-	unsigned int errcode;
+	uint64_t errcode;
 	char *res;
 	int i, cnt; 
-	unsigned int result = 0x0000000000;
+	uint64_t result = 0x0000000000;
 	i = cnt = 0;
 	res = NULL;
 
@@ -442,6 +541,12 @@ check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f)
 	if (filters & FWSTATUS && !check_proc_status(pinfo->pstate, f->pwstate))
 		result = result ^ FWSTATUS;
 
+	if (filters & TSTATUS && check_thread_status(pinfo->tstate, f->tstate))
+		result = result ^ TSTATUS;
+
+	if (filters & TWSTATUS && !check_thread_status(pinfo->tstate, f->twstate))
+		result = result ^ TWSTATUS;
+
 	if (filters & FCRITICAL)
 		result = result ^ FCRITICAL;
 
@@ -455,9 +560,21 @@ check_proc_filters(unsigned int filters, t_procinfo *pinfo, t_filters *f)
 	    printf("result:%p filters:%p\n", result, filters);
 	errcode = filters ^ result;
 	if (v_debug)
-	    printf("Error code from check_proc_filters: %d\n", errcode);
+	    printf("Error code from check_proc_filters: %p\n", errcode);
 	return errcode;
 };
+
+int
+check_thread_status(char *status, char *filter)
+{
+	int i;
+	int errcode = 0;
+	for (i=0; filter[i]; i++) {
+        if ((filter[i] == 'l' && !strncmp(status, "uwrlck", 6)) || (filter[i] == 'w' && !strncmp(status, "uwait", 5))) 
+            errcode++;
+    }
+    return errcode;
+}
 
 int
 check_proc_status(int status, char *filter)
