@@ -83,7 +83,10 @@ typedef struct {
 typedef struct {
     unsigned int pid;
     unsigned int cnt;
+    unsigned int badcnt;
     unsigned short state;
+    unsigned short add;
+    unsigned short added;
 } pid_s;
 
 typedef struct {
@@ -468,17 +471,21 @@ main (int argc, char **argv)
             if (threads_check) {
                 search_key.pid = kp->ki_pid;
                 if ((mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums))!=NULL) {
-                    if (mypid->state & SBAD)
-                        continue;
                     mypid->cnt++;
+                    if (!mypid->added) {
+                        mypid->added = 1;
+                        s_pnum++;
+                    }
                 } else  {
                     search_key.pid = 0;
                     mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums);
                     mypid->pid = kp->ki_pid;
-                    mypid->cnt = 1;
+                    mypid->cnt = mypid->added = 1;
+                    mypid->badcnt = 0;
                     mypid->state = SGOOD;
+                    mypid->added = 1;
                     qsort(pidlist, cntpt, sizeof(pid_s), compare_pidnums);
-		            s_pnum++;
+                    s_pnum++;
                 }
             } else {
 		        s_pnum++;
@@ -487,14 +494,16 @@ main (int argc, char **argv)
 		    Filters.ki_start.tv_usec = kp->ki_start.tv_usec;
 	    } else if (threads_check) {
             search_key.pid = kp->ki_pid;
-            if ((mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums))!=NULL && mypid->state & SGOOD) { 
-                mypid->state = SBAD;
-                s_pnum--;
+            if ((mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums))!=NULL) {
+                mypid->badcnt++;
+                if (mypid->added)
+                    s_pnum--;
             } else {
                 search_key.pid = 0;
                 mypid = bsearch(&search_key, pidlist, cntpt, sizeof(pid_s), compare_pidnums);
                 mypid->pid = kp->ki_pid;
-                mypid->cnt = 1;
+                mypid->cnt = 0;
+                mypid->badcnt = 1;
                 mypid->state = SBAD;
                 qsort(pidlist, cntpt, sizeof(pid_s), compare_pidnums);
             }
@@ -523,17 +532,15 @@ check_proc_filters(uint64_t filters, t_procinfo *pinfo, t_filters *f)
 		result = result ^ FCOMMAND;
 	if (filters & FARGS && pinfo->pargs) 
 	{
-	    for (i=1; pinfo->pargs[i]; i++)
-	    {
-		res = strstr(pinfo->pargs[i], f->pargs);    
-		if (res)
-		{
-		    cnt++;
-		    break;
-		}
+	    for (i=1; pinfo->pargs[i]; i++) {
+		    res = strstr(pinfo->pargs[i], f->pargs);    
+		        if (res) {
+		            cnt++;
+		            break;
+		        }
 	    }
 	    if (cnt)
-		result = result ^ FARGS;    
+		    result = result ^ FARGS;    
 	}
 	if (filters & FSTATUS && check_proc_status(pinfo->pstate, f->pstate))
 		result = result ^ FSTATUS;
